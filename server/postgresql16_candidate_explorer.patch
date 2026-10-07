@@ -1,0 +1,497 @@
+--- a/src/include/optimizer/cost.h
++++ b/src/include/optimizer/cost.h
+@@ -71,6 +71,8 @@
+ extern PGDLLIMPORT bool enable_presorted_aggregate;
+ extern PGDLLIMPORT bool enable_async_append;
+ extern PGDLLIMPORT int constraint_exclusion;
++extern PGDLLIMPORT bool enable_join_order_plans;
++extern PGDLLIMPORT bool save_join_order_plan_finished;
+ 
+ extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
+ 								  double index_pages, PlannerInfo *root);
+--- /dev/null
++++ b/src/include/optimizer/jop_extension.h
+@@ -0,0 +1,28 @@
++#include "postgres.h"
++#include "fmgr.h"
++#include "nodes/plannodes.h"
++#include "nodes/pathnodes.h"
++
++#ifndef JOP_EXTENSION_H
++#define JOP_EXTENSION_H
++
++extern char *catch_join_order(PlannerInfo *root, Path *path);
++
++extern void save_join_order_plans(PlannerInfo *root, List *pathlis);
++
++typedef struct string_builder{
++	char* data;
++	size_t len;
++	size_t cap;
++} string_builder;
++
++extern void 
++string_builder_init(string_builder* self);
++
++extern void
++string_builder_destroy(string_builder* self);
++
++extern void 
++string_builder_append(string_builder* self, const char* append);
++
++#endif
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -83,6 +83,7 @@
+ #include "utils/ps_status.h"
+ #include "utils/inval.h"
+ #include "utils/xml.h"
++#include "lero/lero_extension.h"
+ 
+ /* This value is normally passed in from the Makefile */
+ #ifndef PG_KRB_SRVTAB
+@@ -1997,6 +1998,26 @@
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"enable_lero", PGC_USERSET, UNGROUPED,
++			gettext_noop("Enable Lero."),
++			NULL
++		},
++		&enable_lero,
++		false,
++		NULL, NULL, NULL
++    },
++
++	{
++		{"enable_join_order_plans", PGC_USERSET, UNGROUPED,
++			gettext_noop("Enable join order plans."),
++			NULL
++		},
++		&enable_join_order_plans,
++		false,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
+@@ -3505,6 +3526,16 @@
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"lero_subquery_table_num", PGC_USERSET, UNGROUPED,
++			gettext_noop("Cardinality of subqueries whoes number of tables equals to this will be changed."),
++			NULL
++		},
++		&lero_subquery_table_num,
++		SCRAM_SHA_256_DEFAULT_ITERATIONS, 2, INT_MAX,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
+@@ -3783,6 +3814,16 @@
+ 		},
+ 		&log_xact_sample_rate,
+ 		0.0, 0.0, 1.0,
++		NULL, NULL, NULL
++	},
++
++	{
++		{"lero_swing_factor", PGC_USERSET, UNGROUPED,
++			gettext_noop("Sets the fraction of transactions from which to log all statements."),
++			NULL
++		},
++		&lero_swing_factor,
++		0.0, 0.0, DBL_MAX,
+ 		NULL, NULL, NULL
+ 	},
+ 
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -3421,6 +3421,9 @@
+ 	int			lev;
+ 	RelOptInfo *rel;
+ 
++	if (enable_join_order_plans)
++		save_join_order_plan_finished = false;
++
+ 	/*
+ 	 * This function cannot be invoked recursively within any one planning
+ 	 * problem, so join_rel_level[] can't be in use already.
+@@ -3497,6 +3500,9 @@
+ 	rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
+ 
+ 	root->join_rel_level = NULL;
++
++	if (enable_join_order_plans)
++		save_join_order_plan_finished = true;
+ 
+ 	return rel;
+ }
+--- a/src/backend/optimizer/path/joinpath.c
++++ b/src/backend/optimizer/path/joinpath.c
+@@ -152,6 +152,19 @@
+ 	extra.sjinfo = sjinfo;
+ 	extra.param_source_rels = NULL;
+ 
++	List *tmp_list;
++	bool rootrel_candidate_path = false;
++	if (enable_join_order_plans)
++	{
++		int root_relids = (int) root->all_baserels->words[0];
++		int join_relids = (int) joinrelids->words[0];
++		if(root_relids == join_relids){
++			rootrel_candidate_path = true;
++			tmp_list = joinrel->pathlist;
++			joinrel->pathlist = NIL;
++		}
++	}
++
+ 	/*
+ 	 * See if the inner relation is provably unique for this outer rel.
+ 	 *
+@@ -357,6 +370,19 @@
+ 		consider_join_pushdown)
+ 		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+ 							   jointype, &extra);
++
++	if(enable_join_order_plans && rootrel_candidate_path)
++	{	
++		if (tmp_list != NIL) {
++			const ListCell *cell;
++			foreach(cell, joinrel->pathlist)
++			{
++				tmp_list = lappend(tmp_list, lfirst(cell));
++			}
++			list_free(joinrel->pathlist);
++			joinrel->pathlist = tmp_list;
++		}
++	}
+ }
+ 
+ /*
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -98,6 +98,7 @@
+ #include "utils/selfuncs.h"
+ #include "utils/spccache.h"
+ #include "utils/tuplesort.h"
++#include "lero/lero_extension.h"
+ 
+ 
+ #define LOG2(x)  (log(x) / 0.693147180559945)
+@@ -153,6 +154,9 @@
+ bool		enable_partition_pruning = true;
+ bool		enable_presorted_aggregate = true;
+ bool		enable_async_append = true;
++
++bool		enable_join_order_plans = false;
++bool 		save_join_order_plan_finished = false;
+ 
+ typedef struct
+ {
+@@ -5090,6 +5094,10 @@
+ 										   inner_rel->rows,
+ 										   sjinfo,
+ 										   restrictlist);
++	if (enable_lero) {
++        lero_pgsysml_set_joinrel_size_estimates(root, rel, outer_rel,
++                                               inner_rel, sjinfo, restrictlist);
++    }
+ }
+ 
+ /*
+--- /dev/null
++++ b/src/backend/optimizer/jop/jop_extension.c
+@@ -0,0 +1,207 @@
++#include "optimizer/jop_extension.h"
++#include "parser/parsetree.h"
++#include "miscadmin.h"
++#include "nodes/nodes.h"
++
++void string_builder_init(string_builder* self) {
++	self->data = (char*)palloc(10);
++	self->len = 0;
++	self->cap = 10;
++	self->data[0] = '\0';
++}
++
++void string_builder_destroy(string_builder* self) {
++	pfree(self->data);
++}
++
++void string_builder_append(string_builder* self, const char* append) {
++	size_t append_len = strlen(append);
++	size_t new_len = self->len + append_len;
++	size_t new_cap = self->cap;
++	while (new_cap < new_len + 1) {
++		new_cap *= 2;
++	}
++	if (new_cap != self->cap) {
++		char* new_data = (char*) palloc(new_cap);
++		memcpy(new_data, self->data, self->len);
++		pfree(self->data);
++		self->data = new_data;
++		self->cap = new_cap;
++	}
++	memcpy(self->data + self->len, append, append_len + 1);
++	self->len = new_len;
++}
++
++char* catch_join_order(PlannerInfo *root, Path *path)
++{
++    string_builder strb;
++	char* alias_name;
++	char* inner;
++	char* outer;
++	char* return_str;
++	Index seqscan_idx;
++	Index indexscan_idx;
++	Index idxonlyscan_idx;
++	Index bit_heapscan_idx;
++	
++	string_builder_init(&strb);
++	alias_name = "";
++	inner = "";
++	outer = "";
++    switch (path->pathtype)
++	{
++		case T_SeqScan:
++			seqscan_idx = path->parent->relid;
++			alias_name = rt_fetch(seqscan_idx, root->parse->rtable)->eref->aliasname;
++            string_builder_append(&strb, alias_name);
++            break;
++		case T_IndexScan:
++			indexscan_idx = ((IndexPath *)path)->path.parent->relid;
++            alias_name = rt_fetch(indexscan_idx, root->parse->rtable)->eref->aliasname;
++            string_builder_append(&strb, alias_name);
++			break;
++		case T_IndexOnlyScan:
++			idxonlyscan_idx = ((IndexPath *)path)->path.parent->relid;
++            alias_name = rt_fetch(idxonlyscan_idx, root->parse->rtable)->eref->aliasname;
++            string_builder_append(&strb, alias_name);
++			break;
++		case T_BitmapHeapScan:
++			bit_heapscan_idx = ((BitmapHeapPath *)path)->path.parent->relid;
++            alias_name = rt_fetch(bit_heapscan_idx, root->parse->rtable)->eref->aliasname;
++            string_builder_append(&strb, alias_name);
++			break;
++		case T_HashJoin:
++			inner = catch_join_order(root, ((HashPath* )path)->jpath.innerjoinpath);
++			outer = catch_join_order(root, ((HashPath* )path)->jpath.outerjoinpath);
++            string_builder_append(&strb, "(");
++            string_builder_append(&strb, outer);
++            string_builder_append(&strb, " ");
++            string_builder_append(&strb, inner);
++            string_builder_append(&strb, ")");
++            pfree(inner);
++            pfree(outer);
++            break;
++		case T_MergeJoin:
++			inner = catch_join_order(root, ((MergePath* )path)->jpath.innerjoinpath);
++			outer = catch_join_order(root, ((MergePath* )path)->jpath.outerjoinpath);
++            string_builder_append(&strb, "(");
++            string_builder_append(&strb, outer);
++            string_builder_append(&strb, " ");
++            string_builder_append(&strb, inner);
++            string_builder_append(&strb, ")");
++            pfree(inner);
++            pfree(outer);
++            break;
++		case T_NestLoop:;
++			inner = catch_join_order(root, ((NestPath* )path)->jpath.innerjoinpath);
++			outer = catch_join_order(root, ((NestPath* )path)->jpath.outerjoinpath);
++            string_builder_append(&strb, "(");
++            string_builder_append(&strb, outer);
++            string_builder_append(&strb, " ");
++            string_builder_append(&strb, inner);
++            string_builder_append(&strb, ")");
++            pfree(inner);
++            pfree(outer);            
++			break;
++		case T_Material:
++			outer = catch_join_order(root, ((MaterialPath* )path)->subpath);
++            string_builder_append(&strb, outer);
++            pfree(outer);
++			break;
++		case T_Sort:
++			outer = catch_join_order(root, ((SortPath* )path)->subpath);
++            string_builder_append(&strb, outer);
++            pfree(outer);
++            break;
++		case T_Agg:
++			if (IsA(path, GroupingSetsPath))
++			{
++				outer = catch_join_order(root, ((GroupingSetsPath* )path)->subpath);
++                string_builder_append(&strb, outer);
++                pfree(outer);
++			}
++			else
++			{
++				Assert(IsA(path, AggPath));
++				outer = catch_join_order(root, ((AggPath* )path)->subpath);
++                string_builder_append(&strb, outer);
++                pfree(outer);
++			}
++			break;
++		case T_Gather:
++			outer = catch_join_order(root, ((GatherPath *)path)->subpath);
++            string_builder_append(&strb, outer);
++            pfree(outer);
++			break;
++		case T_GatherMerge:
++			outer = catch_join_order(root, ((GatherMergePath *)path)->subpath);
++            string_builder_append(&strb, outer);
++            pfree(outer);
++			break;
++		case T_Memoize:
++			outer = catch_join_order(root, ((MemoizePath* )path)->subpath);
++            string_builder_append(&strb, outer);
++            pfree(outer);           
++			break;
++		case T_Result:
++			if (IsA(path, ProjectionPath))
++			{
++				outer = catch_join_order(root, ((ProjectionPath* )path)->subpath);
++				string_builder_append(&strb, outer);
++				pfree(outer);
++				break;
++			}
++		case T_SampleScan:
++		case T_TidScan:
++		case T_SubqueryScan:
++		case T_FunctionScan:
++		case T_TableFuncScan:
++		case T_ValuesScan:
++		case T_CteScan:
++		case T_WorkTableScan:
++		case T_NamedTuplestoreScan:
++		case T_ForeignScan:
++		case T_CustomScan:
++		case T_Append:
++		case T_MergeAppend:
++		case T_ProjectSet:
++		case T_Unique:
++		case T_Group:
++		case T_WindowAgg:
++		case T_RecursiveUnion:
++		case T_LockRows:
++		case T_ModifyTable:
++			elog(WARNING, "unrecognized node type: %d",
++				 (int) path->type);
++			break;
++		default:
++			elog(ERROR, "unrecognized node type: %d",
++				 (int) path->type);
++			break;
++	}
++    return_str = (char*) palloc(strb.len+1);
++	memcpy(return_str, strb.data, strb.len);
++	return_str[strb.len] = '\0';
++	string_builder_destroy(&strb);
++
++    return return_str;
++}
++
++void save_join_order_plans(PlannerInfo *root, List *pathlis)
++{
++    ListCell *lc;
++    FILE *fp;
++    char output_path[128];
++	snprintf(output_path, sizeof(output_path), "/tmp/dura_join_order_plans_%ld.txt", (long) MyProcPid);
++	fp = fopen(output_path, "w");
++    if (fp == NULL)
++        ereport(ERROR, (errmsg("Could not open candidate join-order output file")));
++    foreach(lc, pathlis)
++    {
++        Path *path = (Path *) lfirst(lc);
++        char *join_order = catch_join_order(root, path);
++        fprintf(fp, "%s\n", join_order);
++        pfree(join_order);
++    }
++	fclose(fp);
++}
+--- /dev/null
++++ b/src/backend/optimizer/jop/Makefile
+@@ -0,0 +1,18 @@
++#-------------------------------------------------------------------------
++#
++# Makefile--
++#    Makefile for optimizer/path
++#
++# IDENTIFICATION
++#    src/backend/optimizer/path/Makefile
++#
++#-------------------------------------------------------------------------
++
++subdir = src/backend/optimizer/jop
++top_builddir = ../../../..
++include $(top_builddir)/src/Makefile.global
++
++OBJS = \
++	jop_extension.o
++
++include $(top_srcdir)/src/backend/common.mk
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -451,7 +451,10 @@
+ 		/*
+ 		 * Do a fuzzy cost comparison with standard fuzziness limit.
+ 		 */
+-		costcmp = compare_path_costs_fuzzily(new_path, old_path,
++		if (enable_join_order_plans && save_join_order_plan_finished)
++				costcmp = COSTS_DIFFERENT;
++		else
++			costcmp = compare_path_costs_fuzzily(new_path, old_path,
+ 											 STD_FUZZ_FACTOR);
+ 
+ 		/*
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -67,6 +67,8 @@
+ #include "utils/rel.h"
+ #include "utils/selfuncs.h"
+ #include "utils/syscache.h"
++#include "lero/lero_extension.h"
++#include "optimizer/jop_extension.h"
+ 
+ /* GUC parameters */
+ double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
+@@ -275,7 +277,9 @@
+ {
+ 	PlannedStmt *result;
+ 
+-	if (planner_hook)
++	if (enable_lero)
++		result = lero_pgsysml_hook_planner(parse, query_string, cursorOptions, boundParams);
++	else if (planner_hook)
+ 		result = (*planner_hook) (parse, query_string, cursorOptions, boundParams);
+ 	else
+ 		result = standard_planner(parse, query_string, cursorOptions, boundParams);
+@@ -415,6 +419,11 @@
+ 
+ 	/* Select best Path and turn it into a Plan */
+ 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
++	if (enable_join_order_plans)
++	{
++		save_join_order_plans(root, final_rel->pathlist);
++	}
++
+ 	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction);
+ 
+ 	top_plan = create_plan(root, best_path);
+--- a/src/backend/optimizer/Makefile
++++ b/src/backend/optimizer/Makefile
+@@ -8,6 +8,6 @@
+ top_builddir = ../../..
+ include $(top_builddir)/src/Makefile.global
+ 
+-SUBDIRS     = geqo path plan prep util
++SUBDIRS     = geqo jop path plan prep util
+ 
+ include $(top_srcdir)/src/backend/common.mk

@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "join_order_file": "/tmp/dura_join_order_plans_{backend_pid}.txt",
+  "max_candidate_plans": 64,
+  "deduplicate_plans": true,
+  "load_pg_hint_plan": true
+}

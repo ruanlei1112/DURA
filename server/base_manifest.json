@@ -1,0 +1,46 @@
+[
+  {
+    "path": "src/include/optimizer/cost.h",
+    "base_sha256": "1bf303b0eef08d042def0c7d08201ed2c5ea90392a0023639682e92fa0b81f52"
+  },
+  {
+    "path": "src/include/optimizer/jop_extension.h",
+    "base_sha256": null
+  },
+  {
+    "path": "src/backend/utils/misc/guc_tables.c",
+    "base_sha256": "ed9fd9f7f1da90286345a97f2a43cf320eef0191839edfaed155b6843c6afaee"
+  },
+  {
+    "path": "src/backend/optimizer/path/allpaths.c",
+    "base_sha256": "8429dffc4569367eb5330ba051646a1ec03766900b53d033daeba60094afc17e"
+  },
+  {
+    "path": "src/backend/optimizer/path/joinpath.c",
+    "base_sha256": "e17bb1615f77d6d99f703190685eafa153981491970ffe5e4acad9026d2b640b"
+  },
+  {
+    "path": "src/backend/optimizer/path/costsize.c",
+    "base_sha256": "f9e9fcee367e6f1395c3701650e4c810d2a5b9a70f76fbccbfe9e7c9828e6ebf"
+  },
+  {
+    "path": "src/backend/optimizer/jop/jop_extension.c",
+    "base_sha256": null
+  },
+  {
+    "path": "src/backend/optimizer/jop/Makefile",
+    "base_sha256": null
+  },
+  {
+    "path": "src/backend/optimizer/util/pathnode.c",
+    "base_sha256": "8acc6bd8190f9fc8e76ef98922dfa86f7406e761a399750c9ab21fc78a42574a"
+  },
+  {
+    "path": "src/backend/optimizer/plan/planner.c",
+    "base_sha256": "f278bbe72dea727d3fe095edb69c8790c1da6fe441532992e7c8adf35445d447"
+  },
+  {
+    "path": "src/backend/optimizer/Makefile",
+    "base_sha256": "38561281be6873301d444970e06c1235b7c9d6e8513c9a64d7d16a76421acb54"
+  }
+]
